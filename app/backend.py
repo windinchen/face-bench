@@ -19,6 +19,7 @@ import numpy as np
 from .align import align, crop_square, quality_report
 from .config import DEFAULTS, MODELS, model_path
 from .imaging import to_blob
+from . import fetch as model_fetch
 
 
 @dataclass
@@ -31,6 +32,19 @@ class Stage:
 
 class BackendError(RuntimeError):
     pass
+
+
+class ModelNotReady(BackendError):
+    """模型还没就位：正在后台下载，或者自动下载被关掉了。
+
+    单独一个类型是为了让服务端分得开「等一会儿就能成」（409，前端下载完自动重试）
+    和「参数/文件本身有问题」（400，重试多少次都一样）。
+    """
+
+    def __init__(self, key: str, status: dict | None = None):
+        self.key = key
+        self.status = status or {}
+        super().__init__(model_fetch.describe(key))
 
 
 @dataclass
@@ -149,11 +163,15 @@ class OnnxBackend(Backend):
     key = "onnx"
 
     def __init__(self, rec_key: str = "w600k_r50", det_key: str = "det_10g",
-                 providers: list[str] | None = None, threads: int | None = None):
+                 providers: list[str] | None = None, threads: int | None = None,
+                 auto_fetch: bool = True):
         import onnxruntime as ort
 
         from .scrfd import Scrfd
 
+        # auto_fetch=True：命令行（cli.run）在这儿阻塞下载，缺的模型边下边等；
+        # =False：Web 服务（server.get_backend）只发起后台下载并立刻报错，
+        #         一个 20 秒一次的 /api/env 轮询不能被 180 MB 的下载卡住三分钟。
         self.rec_key, self.det_key = rec_key, det_key
         avail = ort.get_available_providers()
         if providers is None:
@@ -164,9 +182,9 @@ class OnnxBackend(Backend):
         self.providers = providers
         opts = _session_opts(threads)
 
+        if not self._ready(rec_key, auto_fetch):
+            raise ModelNotReady(rec_key, model_fetch.status(rec_key))
         rp = model_path(rec_key)
-        if not rp.exists():
-            raise BackendError(f"识别模型缺失: {rp}")
         self.rec = ort.InferenceSession(str(rp), sess_options=opts, providers=providers)
         self.rec_input = self.rec.get_inputs()[0].name
         self.rec_output = self.rec.get_outputs()[0].name
@@ -175,11 +193,37 @@ class OnnxBackend(Backend):
         self.rec_dim = MODELS.get(rec_key, {}).get("dim", 512)
 
         self.scrfd = None
-        dp = model_path(det_key)
-        if dp.exists():
+        # 检测模型缺失是软失败（照旧能起后端，det_ready=False，评测走整图缩放），
+        # 所以只发起下载、不抛错：光比对口径的评测不依赖检测器。
+        if self._ready(det_key, auto_fetch):
+            dp = model_path(det_key)
             self.scrfd = Scrfd(
                 ort.InferenceSession(str(dp), sess_options=opts, providers=providers)
             )
+
+    @staticmethod
+    def _ready(key: str, auto_fetch: bool) -> bool:
+        """这个模型现在能用吗。不能用的话：要么已经下好了，要么已经发起下载了。
+
+        校验不过也算「不能用」：半截文件和被换过的权重都能被 InferenceSession
+        正常加载，推理不报错却算出错乱的分数，这种看起来合理的错答案最难查。
+
+        不碰 self：自检就能在不加载 ONNX 的前提下把两条路各走一遍。
+        """
+        if not model_fetch.needed(key):
+            return True
+        if not auto_fetch:
+            model_fetch.start(key)          # 后台下载，进度走 /api/env，不卡这个请求
+            return False
+        try:
+            # quiet：进度归调用方打（cli.run 用 fetch.wait 打百分比），
+            # 这儿再插两句「下载 / 完成」只会把那条进度线冲得断断续续。
+            model_fetch.ensure(key, wait=True, quiet=True)
+        except model_fetch.ModelError as exc:
+            raise BackendError(
+                f"{exc}；可以先手动 bash models/fetch.sh {key} 补，"
+                "或 FACE_AUTO_FETCH=0 关掉自动下载") from exc
+        return not model_fetch.needed(key)
 
     def detect(self, img, det_size: int = 320, thresh: float = 0.5, nms: float = 0.4) -> list[Face]:
         if self.scrfd is None:

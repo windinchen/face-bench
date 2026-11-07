@@ -2,6 +2,8 @@ const $ = (s) => document.querySelector(s);
 const S = { env: null, gallerySel: [], probeSel: [], run: null, persons: [], unreadable: [],
         gp: 1, gs: 80, gq: '', gloading: false,
         page: { offset: 0, only: 'hit', total: 0, matched: 0 } };
+/* 模型还在下载时点「应用」的那次切换：整份请求体存下来，下载完成自动补发一次 */
+S.pendingApply = null;
 
 function toast(msg, ms = 2600) {
   const t = $('#toast'); t.textContent = msg; t.classList.add('on');
@@ -40,18 +42,26 @@ async function whyFailed(r) {
 }
 async function getJSON(url) {
   const r = await fetch(url);
-  if (!r.ok) throw new Error(await whyFailed(r));
+  if (!r.ok) throw await httpError(r);
   return r.json();
 }
 async function postJSON(url, body) {
   const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-  if (!r.ok) throw new Error(await whyFailed(r));
+  if (!r.ok) throw await httpError(r);
   return r.json();
 }
 async function delJSON(url) {
   const r = await fetch(url, { method: 'DELETE' });
-  if (!r.ok) throw new Error(await whyFailed(r));
+  if (!r.ok) throw await httpError(r);
   return r.json();
+}
+/* 状态码要挂在错误对象上：模型还在后台下载时服务端回 409（稍后再试就能成），
+   和 400（参数/文件真有问题）得分开 —— 前者前端要把这次切换记下来，
+   下载完自动补一次，不该让用户对着「下载中」三个字反复点应用。 */
+async function httpError(r) {
+  const e = new Error(await whyFailed(r));
+  e.status = r.status;
+  return e;
 }
 /* 传底库之前先花 0.1 秒确认「这个窗口真的能把字节发出去」。
    内置预览窗口、嵌在应用里的网页壳子这类环境，File 句柄交给网络进程后读不到
@@ -147,17 +157,59 @@ function renderEnvPills() {
   /* 文件在不等于文件没问题：sha256 对不上（下到一半断过网、文件被人换过）时
      推理要么起不来要么算出错乱的分数，pill 不能还是一片绿「已下载」。 */
   const broken = e.models.filter((x) => x.exists && x.sha256_ok === false).length;
+  const busy = e.models.filter((x) => x.fetching);
+  const failed = e.models.filter((x) => x.fetch_state === 'failed');
+  /* 下载中就把 pill 换成琥珀色带进度：180 MB 在板子的网速下要几分钟，
+     只显示「0/4 已下载」看着就是卡死了，人会去反复点注册、反复重启服务。 */
+  const modelVal = `${ready}/${tot} 已下载`
+    + (broken ? ` · ${broken} 个校验失败` : '')
+    + (busy.length ? ` · ${busy.map((x) => `下载中 ${x.key} ${fPct(x)}`).join(' ')}` : '')
+    + (failed.length && !busy.length ? ` · ${failed.length} 个下载失败` : '');
+  const modelCls = busy.length ? 'warn' : (ready === tot && !broken && !failed.length ? 'ok' : 'bad');
   const pills = [
-    ['设备', `${m.system || ''} ${m.machine || ''}`, true],
-    ['CPU 核', m.cpu_count, true],
-    ['推理', e.backend?.key === 'onnx' ? '本机 ONNX' : (e.backend?.error ? '未就绪' : '远程'), !e.backend?.error],
-    ['onnxruntime', e.backend?.onnxruntime || '—', true],
-    ['模型', broken ? `${ready}/${tot} 已下载 · ${broken} 个校验失败` : `${ready}/${tot} 已下载`,
-      ready === tot && !broken],
-    ['底库', e.gallery ? `${e.gallery.persons} 人 / ${e.gallery.templates} 张` : '空', (e.gallery?.templates || 0) > 0],
+    ['设备', `${m.system || ''} ${m.machine || ''}`, 'ok'],
+    ['CPU 核', m.cpu_count, 'ok'],
+    ['推理', e.backend?.key === 'onnx' ? '本机 ONNX' : (e.backend?.error ? '未就绪' : '远程'),
+      e.backend?.error ? 'bad' : 'ok'],
+    ['onnxruntime', e.backend?.onnxruntime || '—', 'ok'],
+    ['模型', modelVal, modelCls],
+    ['底库', e.gallery ? `${e.gallery.persons} 人 / ${e.gallery.templates} 张` : '空',
+      (e.gallery?.templates || 0) > 0 ? 'ok' : 'bad'],
   ];
-  $('#env').innerHTML = pills.map(([l, v, ok]) =>
-    `<span class="pill ${ok ? 'ok' : 'bad'}">${l} <b>${esc(v)}</b></span>`).join('');
+  $('#env').innerHTML = pills.map(([l, v, cls]) =>
+    `<span class="pill ${cls}">${l} <b>${esc(v)}</b></span>`).join('');
+}
+/* 下载进度：服务端算不出总尺寸（远端不报 content-length）时退到「已下多少 MB」，
+   总比空着强，也看得出来网速有没有死。 */
+const fPct = (x) => (x.fetch_pct === null || x.fetch_pct === undefined
+  ? `${Math.floor((x.fetch_bytes || 0) / 1048576)}MB` : `${x.fetch_pct}%`);
+
+/* 模型那一行下面的说明：当前识别器口径 + 下载进度 / 失败原因。
+   单拆一个函数是因为 2 秒一轮的下载轮询也要刷它，但不能再顺手重画下拉框
+   （用户可能正开着下拉框挑模型）。 */
+function renderModelNote(e) {
+  e = e || S.env;
+  if (!e || !Array.isArray(e.models)) return;
+  const cur = e.models.find((x) => x.key === e.state.rec);
+  const bits = [];
+  if (cur) {
+    bits.push(`当前识别器：${cur.note}${cur.mrall_far1e6 ? ` · 公开榜 FAR=1e-6 通过率 ${cur.mrall_far1e6}%` : ''}`
+      + (cur.threshold ? ` · 建议阈值 ${cur.threshold}` : '')
+      + (cur.exists && cur.sha256_ok === false ? ' · 模型文件校验失败，正在重新下载' : ''));
+  }
+  const busy = e.models.filter((x) => x.fetching);
+  if (busy.length) {
+    bits.push('模型自动下载中：' + busy.map((x) => `${x.key} ${fPct(x)}`
+      + (x.fetch_total ? `/${Math.floor(x.fetch_total / 1048576)}MB · ${x.fetch_mbps}MB/s` : '')).join('，'));
+  }
+  const failed = e.models.filter((x) => x.fetch_state === 'failed');
+  if (failed.length && !busy.length) {
+    bits.push('下载失败：' + failed.map((x) => `${x.key}（${x.fetch_error || '原因见服务端日志'}）`
+      + (x.fetch_retry_in ? `，${x.fetch_retry_in} 秒后重试` : '')).join('；')
+      + (e.auto_fetch === false ? '；自动下载已被 FACE_AUTO_FETCH=0 关掉，手动跑 bash models/fetch.sh'
+                                : '；稍后自动重试，也可以手动 bash models/fetch.sh'));
+  }
+  $('#model-note').textContent = bits.join('　');
 }
 async function loadEnv() {
   S.env = await getJSON('/api/env');
@@ -173,40 +225,56 @@ async function loadEnv() {
     .map((x) => `<option value="${x.key}" ${x.key === e.state.rec ? 'selected' : ''}>${x.key}${mdlTag(x)}</option>`).join('');
   det.innerHTML = e.models.filter((x) => x.kind === 'detection')
     .map((x) => `<option value="${x.key}" ${x.key === e.state.det ? 'selected' : ''}>${x.key}${mdlTag(x)}</option>`).join('');
-  const cur = e.models.find((x) => x.key === e.state.rec);
-  $('#model-note').textContent = cur
-    ? `当前识别器：${cur.note}${cur.mrall_far1e6 ? ` · 公开榜 FAR=1e-6 通过率 ${cur.mrall_far1e6}%` : ''}${cur.threshold ? ` · 建议阈值 ${cur.threshold}` : ''}`
-      + (cur.exists && cur.sha256_ok === false ? ' · 模型文件校验失败，请重新下载' : '') : '';
+  renderModelNote(e);
   $('#threads').value = e.state.threads || '';
   $('#remote-url').value = e.state.remote_url || '';
   $('#bk-kind').value = e.state.backend_kind || 'onnx';
   await refreshGallery();   // 底库列表按页取，几千人不卡界面
 }
-const mdlTag = (x) => (!x.exists ? '（未下载）' : x.sha256_ok === false ? '（校验失败）' : '');
+/* 下拉框里每个模型后面的状态尾巴。正在下载的要写进度：几千张底库拖进来才
+   告一句「模型没下载」太晚了，选模型那一步就该看见它还在下。 */
+const mdlTag = (x) => (x.fetching ? `（下载中 ${fPct(x)}）`
+  : !x.exists ? (x.fetch_state === 'failed' ? '（下载失败）' : '（未下载）')
+  : x.sha256_ok === false ? '（校验失败）' : '');
 
 /* 换模型后旧批次不能再当结论看：批次的 backend 和底库向量都是按当时的识别模型算的，
    结果卡继续挂着会让人觉得刚切的模型跑出了那个精度。两边都折算成「识别模型标识」来比。 */
 const modelKeyOf = (bk) => (!bk ? '' : bk.recognition || `${bk.key}|${bk.base_url || ''}`);
+async function applyBackend(body, note) {
+  /* /api/backend 失败现在一律走 HTTPException，postJSON 直接抛错到调用方的 catch；
+     以前那句 if (r.error) 是早先返回 {"error":…} 时代的遗留，永远不成立。
+     注意 /api/env 里的 backend.error 还活着（那儿是「后端起不来也要把环境吐出来」），别跟着删。 */
+  const r = await postJSON('/api/backend', body);
+  S.pendingApply = null;
+  toast(note || '后端已切换'); await loadEnv();
+  /* 下拉里可能已经躺着别的模型跑出来的批次，切完必须重新取一遍列表 */
+  try { await loadRuns(); } catch (x) { /* 列表没刷出来不影响切换本身 */ }
+  const now = modelKeyOf(r.backend), was = modelKeyOf(S.run && S.run.backend);
+  if (now && was && now !== was) {
+    S.run = null;
+    $('#card-result').hidden = true;
+    clearResult();
+    toast('换模型需重新注册底库后重跑：旧模型的批次结果已收起，想回看从「历史批次」里打开', 10000);
+  }
+  return r;
+}
 $('#apply-backend').onclick = async () => {
   const body = { rec: $('#rec-model').value, det: $('#det-model').value,
     threads: $('#threads').value ? +$('#threads').value : null,
     backend_kind: $('#bk-kind').value, remote_url: $('#remote-url').value.trim() };
   try {
-    /* /api/backend 失败现在一律走 HTTPException，postJSON 直接抛错到底下的 catch；
-       以前那句 if (r.error) 是早先返回 {"error":…} 时代的遗留，永远不成立。
-       注意 /api/env 里的 backend.error 还活着（那儿是「后端起不来也要把环境吐出来」），别跟着删。 */
-    const r = await postJSON('/api/backend', body);
-    toast('后端已切换'); await loadEnv();
-    /* 下拉里可能已经躺着别的模型跑出来的批次，切完必须重新取一遍列表 */
-    try { await loadRuns(); } catch (x) { /* 列表没刷出来不影响切换本身 */ }
-    const now = modelKeyOf(r.backend), was = modelKeyOf(S.run && S.run.backend);
-    if (now && was && now !== was) {
-      S.run = null;
-      $('#card-result').hidden = true;
-      clearResult();
-      toast('换模型需重新注册底库后重跑：旧模型的批次结果已收起，想回看从「历史批次」里打开', 10000);
+    await applyBackend(body);
+  } catch (e) {
+    if (e.status === 409) {
+      /* 409 = 模型还在后台下，不是切坏了。把这次请求存下来，
+         下载完由轮询那一头自动补发，省掉「等几分钟再回来点一次应用」。 */
+      S.pendingApply = body;
+      toast('模型还在下载，下载完成后自动切换：' + e.message, 9000);
+    } else {
+      S.pendingApply = null;
+      toast('切换失败：' + e.message, 7000);
     }
-  } catch (e) { toast('切换失败：' + e.message); }
+  }
 };
 
 /* ---------- 底库 ---------- */
@@ -1904,19 +1972,59 @@ function draftCfg(env) {
 function restoreCfg(draft) {
   draft.forEach(([sel, v]) => { const el = $(sel); if (el) el.value = v; });
 }
-setInterval(async () => {
-  let e;
-  try { e = await getJSON('/api/env'); } catch (x) { return; }   // 轮询失败下一轮再来
-  const prev = S.env;
-  S.env = e;
-  /* 顶栏的推理后端、模型、底库计数全取自 S.env：以前有批次在跑就只换数据不重画，
-     页面挂一下午，pill 上还写着切走前的模型和人数。pill 重画不要钱，照画不误；
-     整份底库列表还是只在没人跑批次、而且模板数真的变了时才重取（别把用户翻到的页刷掉）。 */
-  renderEnvPills();
-  checkBuild();
-  if (!S.run && (e.gallery?.templates || 0) !== (prev?.gallery?.templates || 0)) {
-    const draft = draftCfg(prev);
-    try { await loadEnv(); } catch (x) { /* 这次补刷没成，下一轮再补 */ }
-    restoreCfg(draft);
+/* 顶栏轮询。平时 20 秒一轮，有模型在后台下载时缩到 2 秒：180 MB 在 20 秒的粒度下
+   就是「0% 卡半天不动」，看着跟服务死了一个样，人会去反复点注册、反复重启服务。
+   间隔要每轮现算，所以是 setTimeout 自己接自己，不是 setInterval。 */
+async function pollEnv() {
+  try {
+    let e;
+    try { e = await getJSON('/api/env'); } catch (x) { return; }   // 轮询失败下一轮再来
+    const prev = S.env;
+    S.env = e;
+    /* 顶栏的推理后端、模型、底库计数全取自 S.env：以前有批次在跑就只换数据不重画，
+       页面挂一下午，pill 上还写着切走前的模型和人数。pill 重画不要钱，照画不误；
+       整份底库列表还是只在没人跑批次、而且模板数真的变了时才重取（别把用户翻到的页刷掉）。 */
+    renderEnvPills();
+    renderModelNote(e);
+    checkBuild();
+    const was = (prev && prev.fetching) || [], now = e.fetching || [];
+    for (const k of was.filter((x) => !now.includes(x))) {
+      /* 下完了要说一声。几百 MB 的下载没人盯着，界面一声不吭的话，
+         用户永远停在「到底下好没有」和「是不是下坏了」之间。 */
+      const m = (e.models || []).find((x) => x.key === k);
+      if (m && m.exists && m.sha256_ok !== false) toast(`模型 ${k} 下载完成，可以用了`, 6000);
+      else if (m && m.fetch_state === 'failed') {
+        toast(`模型 ${k} 下载失败：${m.fetch_error || '原因见服务端日志'}`, 9000);
+        clientError('model-fetch', new Error(m.fetch_error || ''), { model: k });
+      }
+    }
+    await applyPendingBackend(e);
+    if (!S.run && (e.gallery?.templates || 0) !== (prev?.gallery?.templates || 0)) {
+      const draft = draftCfg(prev);
+      try { await loadEnv(); } catch (x) { /* 这次补刷没成，下一轮再补 */ }
+      restoreCfg(draft);
+    }
+  } finally {
+    scheduleEnvPoll();          // 不管这轮成没成，下一轮都得排上
   }
-}, 20000);
+}
+/* 下载完把之前被 409 挡回去的那次「应用模型」补发掉，省得人等几分钟回来再点一次。 */
+async function applyPendingBackend(e) {
+  const pend = S.pendingApply;
+  if (!pend || (e.fetching || []).length) return;
+  const want = (e.models || []).filter((m) => m.key === pend.rec || m.key === pend.det);
+  const ready = pend.backend_kind === 'remote' || !want.length
+    || want.every((m) => m.exists && m.sha256_ok !== false);
+  S.pendingApply = null;        // 成不成都不留悬案：下坏了的模型重试一百次也不会自己变好
+  if (!ready) return;
+  try {
+    await applyBackend(pend, '模型下载完成，已自动切换后端');
+  } catch (x) {
+    toast('下载完成但自动切换失败：' + x.message, 8000);
+  }
+}
+function scheduleEnvPoll() {
+  clearTimeout(S.envTimer);
+  S.envTimer = setTimeout(pollEnv, ((S.env && S.env.fetching) || []).length ? 2000 : 20000);
+}
+scheduleEnvPoll();

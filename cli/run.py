@@ -16,6 +16,7 @@ import re
 from pathlib import Path
 
 from app import bench
+from app import fetch as model_fetch
 from app.backend import build
 from app.config import DEFAULTS, REPORT_DIR, infer_person, write_json
 from app.gallery import Gallery
@@ -97,6 +98,17 @@ def main() -> None:
     ap.add_argument("--probe-mode-id", default="auto", choices=modes,
                     help="探针真值来源，含义同 --gallery-mode")
     a = ap.parse_args()
+
+    # 缺模型就在开跑前补齐，并把进度打在终端上。build() 自己也会等（auto_fetch 默认开），
+    # 但那副样子是「屏幕一片安静，三分钟后突然开始跑」，板子上看着就是卡死了。
+    # 命令行是明着要跑批的，等下载合理，不说明才不合理。
+    ready = model_fetch.wait([a.rec, a.det], show=True)
+    if ready.get(a.rec) != "ready":
+        raise SystemExit(f"识别模型没就位：{model_fetch.describe(a.rec)}")
+    if a.mode != "raw" and ready.get(a.det) != "ready":
+        # raw 根本不检测，缺检测模型照样能跑；auto/det 缺了它每张图都算 error，
+        # 跑完十几分钟只换来一张检出率 0 的表，比当场报错坑人得多。
+        raise SystemExit(f"检测模型没就位（--mode {a.mode} 要用它）：{model_fetch.describe(a.det)}")
 
     bk = build("onnx", rec_key=a.rec, det_key=a.det)
     # 用命令行专属的底库目录（data/gallery_cli_<key>），不碰界面上那份。

@@ -31,7 +31,8 @@ from starlette.concurrency import run_in_threadpool
 from starlette.requests import ClientDisconnect
 
 from . import bench, config
-from .backend import BackendError, OnnxBackend, build
+from . import fetch as model_fetch
+from .backend import BackendError, ModelNotReady, OnnxBackend, build
 from .config import DATA_DIR, DEFAULTS, REPORT_DIR, UNKNOWN, infer_person, model_status
 from .gallery import Gallery
 from .imaging import decode, encode_jpg, limit_side
@@ -299,8 +300,31 @@ def get_backend(force: bool = False):
                 BACKEND = build(
                     "onnx", rec_key=STATE["rec"], det_key=STATE["det"],
                     providers=STATE["providers"], threads=STATE["threads"],
+                    # 服务端绝不在这儿等下载：/api/env 每 20 秒轮一次，
+                    # 阻塞的话一次 180 MB 的下载能把轮询卡住三分钟，顶栏整个冻住。
+                    # auto_fetch=False 只发起后台下载 + 抛 ModelNotReady，进度看 /api/env。
+                    auto_fetch=False,
                 )
         return BACKEND
+
+
+def backend_http_error(exc: BackendError) -> HTTPException:
+    """模型还在下载 = 409（等一会儿就能成，前端会自动重试），其余 = 400（重试也没用）。"""
+    return HTTPException(409 if isinstance(exc, ModelNotReady) else 400, str(exc))
+
+
+def _backend_or_wait(max_wait: float = 1800.0, force: bool = False):
+    """取后端；模型正在后台下载就先等它下完再试一次。
+
+    只给后台线程用（注册 worker、评测 worker）：这些活儿本来就是异步的，
+    多等一次下载比让用户重新点一遍「开始注册」划算得多。HTTP 请求线程要用
+    get_backend()，那边不能等 —— 顶栏 20 秒一轮的轮询会被一次下载冻住。
+    """
+    try:
+        return get_backend(force=force)
+    except ModelNotReady as e:
+        model_fetch.wait([e.key], show=False, timeout=max_wait)
+        return get_backend(force=force)
 
 
 def get_gallery() -> Gallery:
@@ -346,6 +370,11 @@ def api_env():
         "build": build_id(),
         "gallery": get_gallery().stats(),
         "ready": any(m["exists"] and m["kind"] == "recognition" for m in st),
+        # 自动下载进度总览（明细在 models 每项的 fetch_* 里）：顶栏一句话要用这两项，
+        # auto_fetch=False 时界面得改口提示「手动 bash models/fetch.sh」，
+        # 而不是对着一个永远不会开始的下载干等。
+        "auto_fetch": model_fetch.auto_fetch(),
+        "fetching": model_fetch.fetching(),
     }
     try:
         info["backend"] = get_backend().info()
@@ -365,7 +394,7 @@ def api_backend(payload: dict = Body(...)):
     except BackendError as e:
         # 其余路由一律抛 HTTPException（错误信息在 detail 里），这里以前返回 {"error": ...}，
         # 前端按统一口径取 detail 就永远显示「请求失败」，看不出是模型文件没了还是路径写错
-        raise HTTPException(400, str(e)) from e
+        raise backend_http_error(e) from e
     with LOCK:
         GALLERY = get_gallery()
     return {"backend": bk.info(), "gallery": get_gallery().stats()}
@@ -660,7 +689,7 @@ def _start_enroll(batch: list[tuple[str, str, object]], opts: dict) -> str:
 
     def worker():
         try:
-            bk = get_backend()
+            bk = _backend_or_wait()
         except BackendError as e:
             j.update(status="error", error=str(e))
             return
@@ -700,7 +729,7 @@ def _stream_worker(job_id: str, q, o: dict) -> None:
         STREAMS.pop(job_id, None)
         return
     try:
-        bk = get_backend()
+        bk = _backend_or_wait()
     except BackendError as e:
         j.update(status="error", error=str(e))
         STREAMS.pop(job_id, None)
@@ -1228,7 +1257,7 @@ def _probe_setup(opts: dict) -> dict:
     try:
         bk = get_backend()
     except BackendError as e:
-        raise HTTPException(400, str(e))
+        raise backend_http_error(e) from e
     p = {**DEFAULTS, **_params_of(opts.get("params"))}
     run_id = uuid.uuid4().hex[:8]
     out_dir = PROBE_DIR / run_id
@@ -2217,6 +2246,17 @@ app.mount("/static", NoCacheStatic(directory=str(STATIC)), name="static")
 def main() -> None:
     import uvicorn
     load_runs_from_disk()
+
+    # 首次使用（models/ 是空的）就在这儿把默认那对模型发起后台下载：
+    # 用户从「浏览器打开地址」到「把底库拖进来」有一二十秒，够 curl 起速；
+    # 下没下完顶栏都看得见，缺模型时点注册也会自己等，不会让人白点一次。
+    # 放 main() 而不是模块导入时：cli.selftest 也 import 本模块，
+    # 导入即联网下载会让自检在离网的机器上又慢又红。
+    if STATE["backend_kind"] == "onnx":
+        started = model_fetch.prefetch([STATE["rec"], STATE["det"]])
+        if started:
+            log.info("缺模型 %s，已发起后台下载（进度见界面顶栏；命令行看 bash models/fetch.sh）",
+                     "、".join(started))
 
     port = int(os.environ.get("PORT", "8617"))
     uvicorn.run(app, host="0.0.0.0", port=port,

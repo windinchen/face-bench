@@ -204,10 +204,21 @@ def _hash_file(path: Path, chunk: int) -> str:
 
 
 def model_status() -> list[dict]:
+    """四个模型的文件状态 + 最近一次自动下载的进度。
+
+    下载进度在这里合并而不是让前端再问一个接口：顶栏那颗 pill 每 20 秒就要
+    同时知道「文件在不在」和「下到百分之几」，分两个接口就会一个新一旧，
+    自动下载刚完成的那一秒 pill 上写着「正在下载 100%」而模型已经能用了。
+    fetch 反过来要读 MODELS / sha256_of，所以函数内延迟导入，绕开循环引用。
+    """
+    from .fetch import statuses            # 延迟导入：app.fetch 依赖本模块
+    dl = statuses()
     out = []
     for key, cfg in MODELS.items():
         p = model_path(key)
         exists = p.exists()
+        d = dl.get(key) or {}
+        fetching = d.get("state") in ("queued", "download", "verify")
         out.append(
             {
                 "key": key,
@@ -222,6 +233,16 @@ def model_status() -> list[dict]:
                 "expected_sha256": cfg["sha256"],
                 "threshold": cfg.get("far1e6_threshold"),
                 "mrall_far1e6": cfg.get("mrall_far1e6"),
+                # 自动下载进度：state = queued/download/verify/done/failed/ready/wait
+                "fetch_state": d.get("state"),
+                "fetch_pct": d.get("pct") if fetching else None,
+                "fetch_bytes": int(d.get("bytes_done") or 0),
+                "fetch_total": int(d.get("bytes_total") or 0),
+                "fetch_mbps": d.get("mbps"),
+                "fetch_error": d.get("error"),
+                "fetch_retry_in": int(d.get("retry_in") or 0),
+                "fetching": fetching,
+                "downloadable": bool(cfg.get("url") or cfg.get("zip")),
             }
         )
     return out

@@ -27,6 +27,15 @@
 25) 删单个批次会不会连累别的批次，或只删掉报告留下探针目录
 26) 删单个人会不会连累别人，或人不在库里还报「删除成功」
 27) 解码失败的坏图会不会被一张假像素冒充成「漏检」，害得 n_error 恒为 0
+45) 四处同时缺同一个模型时会不会起三路 curl 抢带宽、两个进度条互相盖写
+46) 重下失败或下到错模型时，会不会把原来那份模型一起带走
+47) 自动下载关不关得掉、失败后会不会 20 秒一次反复抽同一个镜像
+48) 磁盘只剩几 MB 时会不会闷头下到 99% 才把板子的 eMMC 写满
+49) 界面引用的下载进度键，服务端 /api/env 是不是全都产出
+50) 「模型还在后台下」会不会被当成参数错误报 400，让前端空重试
+51) 服务端取后端会不会陪着下载卡住三分钟；命令行会不会不等下载就跑完
+52) 从 zip 抽成员时进度会不会整段卡在 0%，抽完会不会留下分片残留
+ 53) 连得上却不吐字节的镜像会不会抱着总超时假死，害得下一个镜像一直不登场
 
 用法：python -m cli.selftest
 """
@@ -35,17 +44,23 @@ from __future__ import annotations
 import json
 import os
 import re
+import hashlib
+import io
+import subprocess
 import shutil
 import sys
 import tempfile
 import threading
 import time
+import zipfile
 from dataclasses import asdict
+from types import SimpleNamespace
 from pathlib import Path
 
 import numpy as np
 
-from app.backend import Backend, Face
+from app import fetch as mfetch
+from app.backend import Backend, Face, OnnxBackend
 from app.bench import recompute, run_probe, threshold_report
 from app.config import DATA_DIR, UNKNOWN, infer_person
 from app import config as cfg
@@ -1918,6 +1933,476 @@ def t44_cli_templates_zero_means_unlimited():
     print(" 44 命令行 --templates 0 是不限张数，不会注册出空底库  ✓")
 
 
+# --------------------------------------------------------------- 模型自动下载
+# 下面这批全用假登记表 + 假模型目录 + 替身下载函数，不碰网络、不碰真 ONNX。
+
+
+def fake_model_dir(tmp: Path, specs: dict) -> tuple:
+    """把模型目录和登记表换成可控的假模型，返回还原用的快照。
+
+    config 和 fetch 各有一份 MODEL_DIR / MODELS 绑定（都是 from ... import 抄过去的），
+    只换一边会出现「按真表校验、往假目录落盘」的错位，所以两边一起换。
+    """
+    snap = (cfg.MODEL_DIR, cfg.MODELS, mfetch.MODEL_DIR, mfetch.MODELS,
+            dict(mfetch._STATES), dict(mfetch._KEYS))
+    cfg.MODEL_DIR = mfetch.MODEL_DIR = tmp
+    cfg.MODELS = mfetch.MODELS = specs
+    mfetch._STATES.clear()
+    mfetch._KEYS.clear()
+    return snap
+
+
+def restore_model_dir(snap: tuple) -> None:
+    cfg.MODEL_DIR, cfg.MODELS, mfetch.MODEL_DIR, mfetch.MODELS = snap[:4]
+    mfetch._STATES.clear()
+    mfetch._STATES.update(snap[4])
+    mfetch._KEYS.clear()
+    mfetch._KEYS.update(snap[5])
+
+
+def fake_spec(name: str, kind: str = "recognition") -> dict:
+    """一个下载地址可控的假模型；SHA256 由调用方写进去的那份字节决定。"""
+    return {"file": f"{name}.onnx", "kind": kind, "dim": DIM, "size": 112,
+            "sha256": None, "note": "自检用假模型", "far1e6_threshold": None,
+            "url": f"https://example.invalid/{name}.onnx"}
+
+
+def writer(body: bytes, calls: list[str] | None = None):
+    """替身下载：把 body 写成 .part，模拟一次成功的直链下载。"""
+    def _dl(url, part, key=""):
+        if calls is not None:
+            calls.append(key)
+        Path(part).write_bytes(body)
+        return Path(part)
+    return _dl
+
+
+def thrower(msg: str, calls: list[str] | None = None):
+    def _dl(url, part, key=""):
+        if calls is not None:
+            calls.append(key)
+        raise mfetch.ModelError(msg)
+    return _dl
+
+
+def t45_concurrent_fetch_downloads_once():
+    """四处同时要同一个缺失模型，只能起一路下载。
+
+    /api/env 每 20 秒轮一次、注册和评测各自的后台线程也都走 get_backend()，
+    全都可能同时撞上「模型还没下」。要是每个调用各起一路 curl，就是三路
+    180 MB 抢同一份带宽，外加同一个模型两个进度条互相盖写 —— 界面上表现为
+    进度从 60% 跳回 5% 再跳回 30%，谁也不敢信这个数。
+    """
+    tmp = Path(tempfile.mkdtemp(prefix="selftest_t45_"))
+    body = b"R" * 4096
+    spec = fake_spec("fakea")
+    spec["sha256"] = hashlib.sha256(body).hexdigest()
+    calls: list[str] = []
+
+    def slow(url, part, key=""):
+        calls.append(key)
+        time.sleep(0.4)                       # 让后面几个线程赶上来
+        Path(part).write_bytes(body)
+        return Path(part)
+
+    snap = fake_model_dir(tmp, {"fakea": spec})
+    orig = mfetch.fetch_direct
+    mfetch.fetch_direct = slow
+    try:
+        threads = [threading.Thread(target=mfetch.start, args=("fakea",)) for _ in range(4)]
+        for t in threads:
+            t.start()
+        got = mfetch.wait(["fakea"], show=False, timeout=30)
+        for t in threads:
+            t.join(5)
+        assert got == {"fakea": "ready"}, f"没等到就位：{got}"
+        assert len(calls) == 1, f"四路并发起了 {len(calls)} 个下载"
+        assert not mfetch.needed("fakea"), "文件到位了还说缺"
+        assert not list(tmp.glob("*.part")), "下完没把 .part 收干净"
+        mfetch.start("fakea")                 # 已就位还来问：不该再下一遍
+        mfetch.watch(["fakea"], show=False, timeout=5)
+        assert len(calls) == 1, f"已就位又被重下一遍：{len(calls)} 次"
+    finally:
+        mfetch.fetch_direct = orig
+        restore_model_dir(snap)
+        shutil.rmtree(tmp, ignore_errors=True)
+    print(" 45 四处同时缺同一个模型只起一路下载，.part 不留残留、就位后不再重下  ✓")
+
+
+def t46_failed_refetch_keeps_the_file_that_is_there():
+    """校验不过的模型重下时，失败不能把原来那份一起带走。
+
+    半截文件（断网留下的）和被换过的权重现在都算「要重下」。老写法是
+    「SHA 不符就删掉原件、提示用户自己重来」—— 偏偏网络也抽风的话，
+    原来那份还能凑合用的 166 MB 就没了，得从镜像重拉一整份。
+    现在改成先下 .part、验过 SHA 才 replace：正式名上永远是旧文件或新文件，
+    没有「两个都没有」这一格。
+    """
+    tmp = Path(tempfile.mkdtemp(prefix="selftest_t46_"))
+    old, new = b"OLD" * 500, b"NEW" * 500
+    spec = fake_spec("fakeb")
+    spec["sha256"] = hashlib.sha256(new).hexdigest()
+    out = tmp / spec["file"]
+    out.write_bytes(old)
+    snap = fake_model_dir(tmp, {"fakeb": spec})
+    orig = mfetch.fetch_direct
+    try:
+        assert mfetch.needed("fakeb"), "校验不符却没说缺，半截文件会被将就着算分数"
+
+        mfetch.fetch_direct = thrower("网络断了")
+        try:
+            mfetch.ensure("fakeb", wait=True, quiet=True)
+            raise AssertionError("下载失败却当成功了")
+        except mfetch.ModelError as exc:
+            assert "网络断了" in str(exc), exc
+        assert out.read_bytes() == old, "重下失败，原来那份模型却被删了"
+
+        mfetch.fetch_direct = writer(b"WRONG" * 300)      # 下「成功」了，但不是那个模型
+        try:
+            mfetch.ensure("fakeb", wait=True, quiet=True)
+            raise AssertionError("SHA256 不符却把模型装上去了")
+        except mfetch.ModelError as exc:
+            assert "SHA256" in str(exc), exc
+        assert out.read_bytes() == old, "装错模型还把旧文件顶掉了"
+        assert not list(tmp.glob("*.part")), "SHA 不符的坏文件留着，下次续传还是坏的"
+
+        mfetch.fetch_direct = writer(new)
+        assert mfetch.ensure("fakeb", wait=True, quiet=True) == "ok"
+        assert out.read_bytes() == new, "换新的没换成"
+        assert not mfetch.needed("fakeb") and not list(tmp.glob("*.part"))
+    finally:
+        mfetch.fetch_direct = orig
+        restore_model_dir(snap)
+        shutil.rmtree(tmp, ignore_errors=True)
+    print(" 46 重下失败或装错模型都动不了原文件，坏 .part 当场清掉  ✓")
+
+
+def t47_auto_fetch_switch_and_failure_cooldown():
+    """自动下载要关得掉，失败要冷却，命令行仍能手推。
+
+    /api/env 一轮就会顺手补发一次缺失模型的下载：镜像抽风时没有冷却，
+    等于每 20 秒重新敲一次 gh-proxy，日志刷满、连接白占着。
+    FACE_AUTO_FETCH=0 是给板子留的闸 —— 既不能「自动下载关不掉」，
+    也不能反过来连 bash models/fetch.sh 都被同一个开关拦住：那是用户明着要下的。
+    """
+    tmp = Path(tempfile.mkdtemp(prefix="selftest_t47_"))
+    body = b"Z" * 2048
+    specs = {}
+    for name in ("fakec", "faked"):
+        s = fake_spec(name, "recognition" if name == "fakec" else "detection")
+        s["sha256"] = hashlib.sha256(body).hexdigest()
+        specs[name] = s
+    calls: list[str] = []
+    snap = fake_model_dir(tmp, specs)
+    orig = mfetch.fetch_direct
+    mfetch.fetch_direct = thrower("镜像 502", calls)
+    try:
+        mfetch.start("fakec")
+        mfetch.watch(["fakec"], show=False, timeout=10)
+        st = mfetch.status("fakec")
+        assert st and st["state"] == "failed", st
+        assert "镜像 502" in st["error"], st
+        assert st["retry_in"] > 0, "失败后没进冷却，轮询会 20 秒一次去抽风镜像"
+        assert "秒后自动重试" in mfetch.describe("fakec"), mfetch.describe("fakec")
+        mfetch.start("fakec")
+        assert len(calls) == 1, f"冷却期内又去敲镜像了：{len(calls)} 次"
+
+        os.environ["FACE_AUTO_FETCH"] = "0"
+        assert mfetch.start("faked") is None, "FACE_AUTO_FETCH=0 还在自动下载"
+        assert mfetch.status("faked") is None, "关掉了还留个半截状态，界面显示一个不存在的进度"
+        assert "FACE_AUTO_FETCH=0" in mfetch.describe("faked"), "关掉了却不告诉用户去哪儿手动补"
+
+        mfetch.fetch_direct = writer(body, calls)
+        n_before = len(calls)
+        got = mfetch.wait(["fakec", "faked"], show=False, timeout=20)
+        assert got == {"fakec": "ready", "faked": "ready"}, got
+        assert len(calls) == n_before + 2, f"命令行强推该把两个都补上，实到 {calls[n_before:]}"
+    finally:
+        os.environ.pop("FACE_AUTO_FETCH", None)
+        mfetch.fetch_direct = orig
+        restore_model_dir(snap)
+        shutil.rmtree(tmp, ignore_errors=True)
+    print(" 47 下载失败进冷却不刷镜像，FACE_AUTO_FETCH=0 真能关掉且命令行仍可强推  ✓")
+
+
+def t48_no_space_stops_before_downloading():
+    """磁盘不够要当场说清楚，别下到 99% 才把板子的 eMMC 写满。
+
+    写满的下场是：下到最后一档失败、盘上多个几百 MB 的 .part、下次接着写
+    还是满，而界面只写一句「下载失败」。提前看一眼剩多少就能换成一句人话。
+    这里连 remote_size 一起走真代码（只把 curl 换成替身），
+    免得自检只盯一个私有函数、真正的调用点被删了还全绿。
+    """
+    tmp = Path(tempfile.mkdtemp(prefix="selftest_t48_"))
+    body = b"Q" * 4096
+    spec = fake_spec("fakee")
+    spec["sha256"] = hashlib.sha256(body).hexdigest()
+    free = {"n": 8 << 20}                       # 只有 8MB，连 64MB 余量都不够
+
+    def fake_run(args, timeout):
+        r = subprocess.CompletedProcess(args, 0, b"", b"")
+        if "-sIL" in args:                      # HEAD（curl 把 -sIL 合在一起写）：报一个 4096 字节的文件
+            # 重定向链：第一跳的 1034 是跳转页的大小，最后那跳才是文件本体
+            r.stdout = (b"HTTP/2 302 Found\r\ncontent-length: 1034\r\n"
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 4096\r\n\r\n")
+        elif "-o" not in args:
+            raise AssertionError(f"看不懂的 curl 参数：{args}")
+        else:                                   # 下载：模拟 curl -o 落盘
+            Path(args[args.index("-o") + 1]).write_bytes(body)
+        return r
+
+    snap = fake_model_dir(tmp, {"fakee": spec})
+    orig_run, orig_shutil = mfetch._run, mfetch.shutil
+    mfetch._run = fake_run
+    mfetch.shutil = SimpleNamespace(disk_usage=lambda p: SimpleNamespace(
+        total=1 << 30, free=free["n"]))
+    try:
+        assert mfetch.remote_size(spec["url"]) == 4096, \
+            "把重定向那一跳的 1034 当成文件大小了：百分比会贴在 0%，磁盘检查也形同虚设"
+        try:
+            mfetch.ensure("fakee", wait=True, quiet=True)
+            raise AssertionError("只剩 8MB 却还是开下了")
+        except mfetch.ModelError as exc:
+            assert "磁盘只剩" in str(exc) and "FACE_MODEL_DIR" in str(exc), exc
+        assert not (tmp / spec["file"]).exists(), "拦下来了却还是把文件落下去了"
+        assert mfetch.status("fakee")["state"] == "failed"
+
+        free["n"] = 200 << 20
+        assert mfetch.ensure("fakee", wait=True, force=True, quiet=True) == "ok"
+        assert (tmp / spec["file"]).read_bytes() == body
+        assert not mfetch.needed("fakee")
+    finally:
+        mfetch._run, mfetch.shutil = orig_run, orig_shutil
+        restore_model_dir(snap)
+        shutil.rmtree(tmp, ignore_errors=True)
+    print(" 48 磁盘余量不够时先拦住并给出 FACE_MODEL_DIR 的出路，腾开就够了  ✓")
+
+
+def t49_frontend_model_progress_keys_exist():
+    """界面引用的每个 fetch_* 键，服务端 /api/env 必须真的产出。
+
+    跟 t29 同一类坑：`${x.fetch_pct}` 取到 undefined 不报错，只是那半句
+    「下载中 12%」永远不显示；服务端把键改名的时候不会有任何人收到通知。
+    """
+    src = (Path(__file__).resolve().parent.parent / "static" / "app.js").read_text(encoding="utf-8")
+    model_refs = set(re.findall(r"\b[A-Za-z_]\w*\.(fetch_[A-Za-z0-9_]+|fetching)\b", src))
+    assert model_refs, "app.js 里没引用任何 fetch_* 键，这条自检等于没跑"
+    st = cfg.model_status()[0]
+    missing = sorted(k for k in model_refs if k not in st)
+    assert not missing, f"界面引用了 /api/env 里没有的模型键 {missing}：进度会静默不显示"
+    env = srv.api_env()
+    if re.search(r"\be\.auto_fetch\b", src):
+        assert "auto_fetch" in env, "前端按 e.auto_fetch 决定提示语，服务端却没下发这个字段"
+    assert isinstance(env.get("fetching"), list), "fetching 必须是列表，前端拿它决定轮询间隔"
+    print(f" 49 界面引用的 {len(model_refs)} 个下载进度键 /api/env 全都产出  ✓")
+
+
+def t50_model_still_downloading_answers_409_not_400():
+    """模型还在下要回 409，别和「参数写错」混成一个 400。
+
+    400 的意思是重试多少次都一样，409 的意思是等一会儿就能成。
+    混在一起，前端就只能弹一句「切换失败：模型正在下载」然后什么都不做，
+    用户得自己记住几分钟后回来再点一次「应用」—— 而切换失败在以前
+    根本不存在「过一会儿自己会好」这一说。
+    """
+    tmp = Path(tempfile.mkdtemp(prefix="selftest_t50_"))
+    specs = {}
+    for name, kind in (("fakef", "recognition"), ("fakeg", "detection")):
+        s = fake_spec(name, kind)
+        s["sha256"] = hashlib.sha256(b"x").hexdigest()     # 故意对不上任何下到的字节
+        specs[name] = s
+    snap = fake_model_dir(tmp, specs)
+    keep = (dict(srv.STATE), srv.BACKEND, srv.GALLERY)
+    orig = mfetch.fetch_direct
+    mfetch.fetch_direct = thrower("离线")
+    try:
+        srv.BACKEND, srv.GALLERY = None, None
+        srv.STATE.update({"backend_kind": "onnx", "rec": "fakef", "det": "fakeg",
+                          "providers": None, "threads": None, "remote_url": ""})
+        try:
+            srv.api_backend({"rec": "fakef", "det": "fakeg"})
+            raise AssertionError("模型没下完却切换成功了")
+        except srv.HTTPException as e:
+            assert e.status_code == 409, f"该回 409，实际 {e.status_code}：{e.detail}"
+            assert "fakef" in e.detail and "下载" in e.detail, e.detail
+        mfetch.watch(["fakef"], show=False, timeout=10)    # 等后台那路收尾
+        assert srv.backend_http_error(srv.BackendError("路径不存在")).status_code == 400, \
+            "真错误也被归到 409，前端会对一个改不好的参数空重试"
+    finally:
+        srv.STATE.clear()
+        srv.STATE.update(keep[0])
+        srv.BACKEND, srv.GALLERY = keep[1], keep[2]
+        mfetch.fetch_direct = orig
+        restore_model_dir(snap)
+        shutil.rmtree(tmp, ignore_errors=True)
+    print(" 50 模型下载中的切换回 409 并带进度，真错误仍是 400  ✓")
+
+
+def t51_server_side_fetch_never_blocks_the_request():
+    """服务端取后端不能陪下载一起等，命令行那侧却必须等。
+
+    /api/env 每 20 秒一轮，顺带还会补发缺失模型的下载：OnnxBackend 要是在这儿
+    阻塞等 180 MB，顶栏就整块冻住三分钟，页面看着像服务挂了，人就去重启服务，
+    然后把下到 90% 的 .part 又变成一次续传。反过来 cli.run 是批量工具，
+    等下载天经地义 —— 最怕的是它不等，直接用整图缩放把整批探针跑完，
+    报出一个假的检出率。
+    """
+    tmp = Path(tempfile.mkdtemp(prefix="selftest_t51_"))
+    body = b"S" * 1024
+    spec = fake_spec("fakeh")
+    spec["sha256"] = hashlib.sha256(body).hexdigest()
+    started = threading.Event()
+
+    def slow(url, part, key=""):
+        started.set()
+        time.sleep(0.5)
+        Path(part).write_bytes(body)
+        return Path(part)
+
+    snap = fake_model_dir(tmp, {"fakeh": spec})
+    orig = mfetch.fetch_direct
+    mfetch.fetch_direct = slow
+    try:
+        t0 = time.perf_counter()
+        ok = OnnxBackend._ready("fakeh", auto_fetch=False)      # 服务端口径
+        spent = time.perf_counter() - t0
+        assert ok is False, "模型还没落地却报告能用了"
+        assert spent < 0.1, f"服务端口径等了 {spent:.2f} 秒，请求被下载卡住了"
+        assert started.wait(2), "报告不可用的同时没把下载发起"
+        assert mfetch.status("fakeh")["state"] in ("queued", "download")
+        assert mfetch.wait(["fakeh"], show=False, timeout=20) == {"fakeh": "ready"}
+        assert OnnxBackend._ready("fakeh", auto_fetch=False) is True, "下完了却没说能用"
+
+        (tmp / spec["file"]).unlink()
+        mfetch._STATES.clear()
+        assert OnnxBackend._ready("fakeh", auto_fetch=True) is True, "命令行口径没等到下完"
+        assert not mfetch.needed("fakeh")
+    finally:
+        mfetch.fetch_direct = orig
+        restore_model_dir(snap)
+        shutil.rmtree(tmp, ignore_errors=True)
+    print(" 51 服务端不等下载只发起，命令行阻塞到模型真落地才继续  ✓")
+
+
+def t52_zip_member_progress_moves_mid_chunk():
+    """从远程 zip 抽成员时，正在下的那一段也要算进进度。
+
+    一段 range 有 16MB，几百 KB/s 的链路上要跑几分钟。字节只停在 curl 的
+    stdout 里时 .part 一动不动，顶栏的进度就连着几分钟贴在 0% —— 人分不清
+    是网慢还是服务断了，多半去重启服务，把已经到手的字节再作废一次。
+    这里让假 curl 只写半截分片，看那一瞬间的进度是不是已经跟着动了。
+    """
+    raw = b"".join(hashlib.sha256(str(i).encode()).digest() for i in range(1200))
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("fakei.onnx", raw)
+    zb = buf.getvalue()
+    spec = fake_spec("fakei")
+    spec.update(sha256=hashlib.sha256(raw).hexdigest(), url=None,
+                zip="https://example.invalid/fake.zip", member="fakei.onnx")
+    tmp = Path(tempfile.mkdtemp(prefix="selftest_t52_"))
+    seen: list[int] = []
+
+    def fake_range(url, start, end, retries=4, sink=None):
+        data = zb[start:end + 1]
+        if sink is None:
+            assert end - start < (1 << 16), "整段成员下载没落盘，进度会一路卡在 0%"
+        else:
+            Path(sink).write_bytes(data[: max(1, len(data) // 2)])    # 只写半截
+            seen.append(int((mfetch.status("fakei") or {}).get("bytes_done") or 0))
+            Path(sink).write_bytes(data)
+        return data
+
+    snap = fake_model_dir(tmp, {"fakei": spec})
+    orig = (mfetch._curl_range, mfetch.remote_size, mfetch.CHUNK)
+    mfetch._curl_range = fake_range
+    mfetch.remote_size = lambda url: len(zb)
+    mfetch.CHUNK = 8192                       # 切小一点，几段才看得出进度在爬
+    try:
+        assert mfetch.wait(["fakei"], show=False, timeout=30) == {"fakei": "ready"}
+        assert (tmp / "fakei.onnx").read_bytes() == raw, "抽出来的成员和原始字节不一样"
+        mid = [x for x in seen if x > 0]
+        assert len(mid) >= 2, f"分片只写了半截时进度还是 0：{seen}"
+        assert not list(tmp.glob("*.chunk")), "抽完没把分片临时文件收干净"
+        assert not mfetch.status("fakei").get("chunk"), "状态里还留着已删掉的分片路径"
+    finally:
+        mfetch._curl_range, mfetch.remote_size, mfetch.CHUNK = orig
+        restore_model_dir(snap)
+        shutil.rmtree(tmp, ignore_errors=True)
+    print(" 52 分片还在半路就计入进度、抽完不留 .chunk 残留，成员字节逐字节一致  ✓")
+
+
+def t53_stalled_connection_hands_off_to_the_next_mirror():
+    """连得上却一个字节都不传的镜像要几十秒就断开，不能抱着总超时假死。
+
+    实测踩过：det_2.5g 走 github 直连抽 zip 成员，curl 挂在那儿三分钟零字节，
+    顶栏进度贴在一个数上一动不动，而底下那条几百 KB/s 的 ghfast 一直没轮到上场
+    —— -m 900 是总超时，这期间 curl 既不断开也不报错，看着和服务断了一个样。
+    两头都验：真发给 curl 的每条下载命令都得带卡死判定（--speed-time /
+    --speed-limit，直链和 range 两条路都要有），而只会超时的镜像试完要换下一个
+    镜像把文件抽成，退避该睡的还是得睡（这里换成记账，不然白等十四秒）。
+    """
+    raw = b"".join(hashlib.sha256(str(i).encode()).digest() for i in range(900))
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("fakei.onnx", raw)
+    zb = buf.getvalue()
+    zip_spec = fake_spec("fakei")
+    zip_spec.update(sha256=hashlib.sha256(raw).hexdigest(), url=None,
+                    zip="https://github.com/fake/repo/releases/download/v1/fake.zip",
+                    member="fakei.onnx")
+    url_spec = fake_spec("faked")
+    url_spec.update(sha256=hashlib.sha256(raw).hexdigest(),
+                    url="https://github.com/fake/repo/releases/download/v1/faked.onnx")
+    tmp = Path(tempfile.mkdtemp(prefix="selftest_t53_"))
+    snap = fake_model_dir(tmp, {"fakei": zip_spec, "faked": url_spec})
+    got: list[list[str]] = []       # 真发给 curl 的每条下载命令（HEAD 不算）
+    tried: list[str] = []           # 按登场顺序记下的镜像地址
+    slept: list[float] = []
+
+    def fake_run(args, timeout):
+        url = next(a for a in reversed(args) if a.startswith("http"))
+        if url not in tried:
+            tried.append(url)
+        head = any(a.startswith("-") and "I" in a for a in args)   # -sIL 是合并写法
+        if not head:
+            assert "--speed-limit" in args and "--speed-time" in args, \
+                f"下载命令里没有卡死判定，僵住的连接会抱着 -m 干等：{args}"
+            got.append(list(args))
+        if "ghfast.top" not in url:        # 第一个镜像：连得上，就是不吐字节
+            return subprocess.CompletedProcess(list(args), 28, b"", b"Operation timed out")
+        if head:
+            return subprocess.CompletedProcess(
+                list(args), 0, f"HTTP/1.1 200 OK\r\ncontent-length: {len(zb)}\r\n\r\n".encode(), b"")
+        rng = args[args.index("--range") + 1] if "--range" in args else None
+        data = zb[int(rng.split("-")[0]):int(rng.split("-")[1]) + 1] if rng else raw
+        if "-o" in args:                   # 落盘的那一段：进度靠 stat 这个文件
+            Path(args[args.index("-o") + 1]).write_bytes(data)
+            return subprocess.CompletedProcess(list(args), 0, b"", b"")
+        return subprocess.CompletedProcess(list(args), 0, data, b"")
+
+    clock = SimpleNamespace(time=time.time, sleep=slept.append)
+    orig = (mfetch._run, mfetch.time)
+    mfetch._run, mfetch.time = fake_run, clock
+    try:
+        assert mfetch.wait(["fakei", "faked"], show=False, timeout=30) == \
+            {"fakei": "ready", "faked": "ready"}, "死镜像没能换到下一个镜像下成"
+        assert (tmp / "fakei.onnx").read_bytes() == raw, "换镜像后抽出的成员字节不对"
+        assert (tmp / "faked.onnx").read_bytes() == raw, "换镜像后直链下下来的字节不对"
+        assert got, "一条下载命令都没抓到，这条自检等于没跑"
+        secs = [int(a[a.index("--speed-time") + 1]) for a in got]
+        assert max(secs) * 4 < mfetch.RANGE_TIMEOUT_S, \
+            f"卡死判定 {max(secs)}s 对着总超时 {mfetch.RANGE_TIMEOUT_S}s 太宽，照样假死"
+        assert tried[0].startswith("https://github.com/fake/") and \
+            any("ghfast.top" in u for u in tried), f"没走到「死镜像换下一个」：{tried}"
+        assert slept, "重试没退避就立刻再敲同一个镜像"
+    finally:
+        mfetch._run, mfetch.time = orig
+        restore_model_dir(snap)
+        shutil.rmtree(tmp, ignore_errors=True)
+    print(" 53 僵住的连接几十秒就断开换镜像，直链/分段两条路都带卡死判定  ✓")
+
+
 def main() -> int:
     print("自检（桩后端，不加载模型）：")
     for fn in (t1_single_person_gallery, t2_unknown_semantics, t3_recall_independent_of_threshold,
@@ -1954,7 +2439,16 @@ def main() -> int:
                t41_record_page_offset_clamped_to_filtered_set,
                t42_number_box_rejects_infinity_with_400,
                t43_ensure_run_hands_back_the_full_records,
-               t44_cli_templates_zero_means_unlimited):
+               t44_cli_templates_zero_means_unlimited,
+               t45_concurrent_fetch_downloads_once,
+               t46_failed_refetch_keeps_the_file_that_is_there,
+               t47_auto_fetch_switch_and_failure_cooldown,
+               t48_no_space_stops_before_downloading,
+               t49_frontend_model_progress_keys_exist,
+               t50_model_still_downloading_answers_409_not_400,
+               t51_server_side_fetch_never_blocks_the_request,
+               t52_zip_member_progress_moves_mid_chunk,
+               t53_stalled_connection_hands_off_to_the_next_mirror):
         fn()
     for key in ("selftest_t1", "selftest_t2", "selftest_t3", "selftest_t4",
                 "selftest_t5", "selftest_t7", "selftest_t8", "selftest_t9",

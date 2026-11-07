@@ -6,6 +6,10 @@ __pycache__/
 # ONNX 权重共 180 MB+，超过 GitHub 单文件 100 MB 上限，不入库
 # 克隆后执行：bash models/fetch.sh
 models/*.onnx
+# 下到一半的断点文件（自动下载留的，下次接着传）
+models/*.part
+# 从 zip 抽成员时正在下的那一段（只为让进度实时可见，抽完就删）
+models/*.part.chunk
 
 # 本地缓存，删了不影响功能（见 README「目录与缓存」）
 data/*

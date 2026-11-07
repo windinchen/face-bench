@@ -41,12 +41,15 @@ else
   fi
 fi
 
-# ---- 提示缺哪些模型（不阻塞，界面照常起）----
+# ---- 缺模型不拦路：服务起来后自己后台下（进度在界面顶栏）----
 miss=""
 for m in w600k_r50.onnx det_10g.onnx; do
   [ -f "models/$m" ] || miss="$miss $m"
 done
-[ -n "$miss" ] && echo "     提示：models/ 缺模型$miss，跑 bash models/fetch.sh 下载"
+if [ -n "$miss" ]; then
+  echo "     models/ 缺$miss —— 服务端起来后自己后台下载，进度看界面顶栏"
+  echo "     （不想自动下：FACE_AUTO_FETCH=0，之后用 bash models/fetch.sh 手动补）"
+fi
 
 echo "[3/3] 启动评测台 → http://127.0.0.1:$PORT （局域网其他机器用本机 IP + 同端口）"
 exec env PORT="$PORT" "$VENV/bin/python" -m app.server
