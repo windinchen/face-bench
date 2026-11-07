@@ -1,0 +1,295 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="app-build" content="__BUILD__">
+<title>人脸 1:N 评测台</title>
+<link rel="stylesheet" href="/static/style.css?v=__BUILD__">
+</head>
+<body>
+<header>
+  <div class="brand">
+    <h1>人脸 1:N 评测台</h1>
+    <span class="sub">底库＝单人大头照 · 探针＝每张图一个人（合影也行） · 逐张人脸独立判定 → 精度 / 耗时报告</span>
+  </div>
+  <div id="env" class="env"></div>
+</header>
+
+<main>
+  <section class="card" id="card-model">
+    <h2>1 · 运行环境</h2>
+    <div class="row">
+      <label>识别模型
+        <select id="rec-model"></select>
+      </label>
+      <label>检测模型
+        <select id="det-model"></select>
+      </label>
+      <label>推理线程
+        <input type="number" id="threads" min="1" max="16" placeholder="自动">
+      </label>
+      <label>推理后端
+        <select id="bk-kind">
+          <option value="onnx">本机 ONNX（PC 基线）</option>
+          <option value="remote">远程推理服务（RK3588 / Android）</option>
+        </select>
+      </label>
+      <label class="grow">远程服务地址
+        <input type="text" id="remote-url" placeholder="http://192.168.1.20:8617">
+      </label>
+      <button id="apply-backend" class="primary">应用</button>
+    </div>
+    <p id="model-note" class="note"></p>
+  </section>
+
+  <section class="card" id="card-gallery">
+    <h2>2 · 底库注册<span class="tag" id="g-count">未注册</span></h2>
+    <div class="row">
+      <label>人员 ID 来源
+        <select id="g-mode">
+          <option value="name" selected>文件名即人名（每张图一个人）</option>
+          <option value="path">文件夹名（每人一个文件夹）</option>
+          <option value="id_num">文件名去序号（张三_0001.jpg）</option>
+          <option value="prefix">文件名前缀（按分隔符）</option>
+          <option value="none">不自动判定</option>
+        </select>
+      </label>
+      <label>前缀分隔符
+        <input type="text" id="g-delim" value="__" size="4">
+      </label>
+      <label>注册时长边上限
+        <input type="number" id="g-maxside" value="1280" min="320" max="4096" step="160">
+      </label>
+      <label>同图最多取几张脸
+        <select id="g-maxfaces">
+          <option value="1" selected>1（只取主角，推荐）</option>
+          <option value="0">全部（合影底库用）</option>
+          <option value="2">最多 2 张</option>
+        </select>
+      </label>
+      <label>每人模板上限
+        <input type="number" id="g-maxtpl" value="0" min="0" max="50" placeholder="0=不限">
+      </label>
+    </div>
+    <div class="drop" id="g-drop">
+      <div class="drop-inner">
+        <strong>把底库图片或文件夹拖到这里</strong>
+        <span>每张图一个人：<code>张三.jpg</code>、<code>李四.jpg</code>（文件名就是人名）；
+        每人一个文件夹：<code>底库/张三/*.jpg</code>，切换上面的规则即可</span>
+        <div class="row center">
+          <button id="g-pick-dir">选择文件夹</button>
+          <button id="g-pick-files">选择文件</button>
+          <button id="g-clear" class="danger"
+                  title="删掉全部人员与模板，并连带删除底库数据库（gallery.db）和 thumbs/ 里的全部底库缩略图">清空底库</button>
+        </div>
+        <div class="row center" id="g-pathrow">
+          <input type="text" id="g-path" size="30" spellcheck="false" autocomplete="off"
+                 placeholder="或填本机底库目录：/Users/你/图片/底库">
+          <button id="g-import" title="服务端直接读本机目录，不经过浏览器上传，几千张更快更稳">导入本机目录</button>
+        </div>
+        <div class="pend" id="g-pend"></div>
+      </div>
+    </div>
+    <div class="prog" id="g-prog" hidden><div class="bar"><i id="g-bar"></i></div><span id="g-progtxt"></span></div>
+    <div class="pager" id="g-pager" hidden>
+      <input type="search" id="g-search" placeholder="搜索人名…" size="14" autocomplete="off">
+      <button id="g-prev" class="small">← 上一页</button>
+      <span class="pageinfo" id="g-pageinfo">— / —</span>
+      <button id="g-next" class="small">下一页 →</button>
+      <label class="psize">每页
+        <select id="g-size">
+          <option value="40">40</option>
+          <option value="80" selected>80</option>
+          <option value="200">200</option>
+        </select>
+      </label>
+      <span class="note" id="g-pagestat"></span>
+    </div>
+    <div id="g-persons" class="persons"></div>
+    <p class="note" id="g-more" hidden></p>
+  </section>
+
+  <section class="card" id="card-probe">
+    <h2>3 · 探针批次（摄像头头像）</h2>
+    <div class="row">
+      <label>探针处理方式
+        <select id="p-mode">
+          <option value="auto">自动（先检测再对齐，检不到就整图缩放）</option>
+          <option value="det">强制检测（检不到判失败）</option>
+          <option value="raw">已裁好，直接缩放对齐</option>
+        </select>
+      </label>
+      <label>探针真值来源
+        <select id="p-idmode">
+          <option value="name" selected>文件名即人名（每张图一个人）</option>
+          <option value="path">文件夹名优先（每人一个文件夹）</option>
+          <option value="id_num">文件名去序号</option>
+          <option value="prefix">文件名前缀（按分隔符）</option>
+          <option value="none">不自动判定</option>
+        </select>
+      </label>
+      <label>检测输入
+        <select id="p-detsize">
+          <option value="160">160（最快）</option>
+          <option value="320" selected>320（推荐）</option>
+          <option value="640">640（小脸/远距）</option>
+        </select>
+      </label>
+      <label>Top-K <input type="number" id="p-topk" value="5" min="1" max="20"></label>
+      <!-- step 必须比推荐阈值精度更细：阈值报告给的是 4 位小数（如 0.4078），
+           step=0.01 会让浏览器把输入吸附到 0.41，等于偷偷换了一个判定线 -->
+      <label>判定阈值 <input type="number" id="p-thr" value="0.4078" step="0.0001" min="0" max="1"></label>
+      <label>并发路数
+        <select id="p-workers"
+                title="同时处理几张图。检测/提特征在 onnxruntime 里会放开 GIL，多核机器上并行是真加速（本机 10 核实测 1 路 23.9 张/秒 → 5 路 41.6 张/秒），代价是单张延迟涨到约 3 倍。几万张抓拍选 4；想量单张响应就选 1。">
+          <option value="1" selected>1（串行，单张最快）</option>
+          <option value="2">2</option>
+          <!-- 档位要盖住第 4 节扫描用的那一组（1/2/3/4/6/8/12）：扫描给出的建议档
+               经常是 3 路或 6 路，下拉里没这一项就没法把建议原样填回来，
+               只能挑一个最近的，等于偷偷换了个配置去复现选型表。 -->
+          <option value="3">3</option>
+          <option value="4">4（多核吞吐优先）</option>
+          <option value="6">6</option>
+          <option value="8">8</option>
+          <option value="12">12</option>
+          <option value="16">16</option>
+        </select>
+      </label>
+      <label>合影识别
+        <select id="p-allfaces">
+          <option value="1" selected>每张脸都识别（推荐）</option>
+          <option value="0">只识别最大的一张</option>
+        </select>
+      </label>
+      <label>忽略小于
+        <input type="number" id="p-minface" value="0" min="0" max="400" step="8"> px 的脸
+      </label>
+    </div>
+    <div class="drop" id="p-drop">
+      <div class="drop-inner">
+        <strong>把摄像头抓到的图拖进来</strong>
+        <span>和底库一样每张图一个人：<code>张三.jpg</code> 或 <code>cam1/张三.jpg</code>，
+        文件名命中底库就是真值；混进合影也行，旁人可在结果里逐张脸补标</span>
+        <div class="row center">
+          <button id="p-pick-dir">选择文件夹</button>
+          <button id="p-pick-files">选择文件</button>
+          <button id="p-run" class="primary">开始评测</button>
+          <label class="grow">历史批次
+            <select id="run-pick"><option value="">— 无 —</option></select>
+          </label>
+          <button id="run-open">打开</button>
+          <!-- 单批删除：删歪一次评测（阈值设错、目录选错）不该把旁边几个好批次
+               一起拖去重跑，一万六千张探针要跑十几分钟。禁用态就是「当前没打开批次」。 -->
+          <button id="run-del" disabled
+                  title="只删当前打开的这一批：报告 JSON 与 data/probes/<批次>/ 里的整图缩略图、对齐人脸截图、meta.jsonl 一起删；别的批次和底库不受影响">删除本批</button>
+          <button id="run-clear" class="danger" disabled
+                  title="删掉全部历史批次：每批的整图缩略图、对齐人脸截图、meta.jsonl 和报告 JSON 一起删；底库与命令行导出的 cli_*.json 不受影响">清空历史批次</button>
+        </div>
+        <div class="pend" id="p-pend"></div>
+        <div class="row center">
+          <label class="grow">探针照片就在这台机器上？直接填目录，不用上传（几百到一万张都行）
+            <input type="text" id="p-path" size="30" spellcheck="false" autocomplete="off"
+                   placeholder="/Users/你/下载/摄像头批次">
+          </label>
+          <button id="p-run-dir"
+                  title="服务端直接读本机目录，不经过浏览器上传。分块读盘+推理，一万张抓拍也能一次评完">评测本机目录</button>
+        </div>
+      </div>
+    </div>
+    <div class="prog" id="p-prog" hidden><div class="bar"><i id="p-bar"></i></div><span id="p-progtxt"></span></div>
+  </section>
+
+  <section class="card" id="card-sweep">
+    <h2>4 · 并发 / 线程扫描（RK3588 选型）</h2>
+    <p class="note">同一批探针图，把「并发路数 × 推理线程数」每个组合各跑一遍，摊成一张表：
+      路数换吞吐、线程数换单帧延迟，只看一个点定不了这块板子该开几路、给几个核。</p>
+    <div class="row">
+      <label class="grow">探针图目录（服务端本机路径，和上面「评测本机目录」填同一个就行）
+        <input type="text" id="s-path" size="30" spellcheck="false" autocomplete="off"
+               placeholder="/Users/你/下载/摄像头批次">
+      </label>
+      <label>抽样张数
+        <input type="number" id="s-limit" value="200" min="24" max="800"
+               title="等间隔抽样。少于 24 张 P95 就是噪声，再多原始字节一次吃不下内存">
+      </label>
+      <label>P50 可用线 ms
+        <input type="number" id="s-lat" value="120" min="10" max="5000"
+               title="给建议档用的线：先在单帧 P50 不超过这条线的格里取吞吐最高；一格都不达标就退回吞吐最高">
+      </label>
+    </div>
+    <div class="row">
+      <b class="tag">并发路数</b><span id="s-workers"></span>
+      <b class="tag">推理线程</b><span id="s-threads"></span>
+      <button id="s-run" class="primary">开始扫描</button>
+    </div>
+    <p class="note" id="s-hint"></p>
+    <div class="prog" id="s-prog" hidden><div class="bar"><i id="s-bar"></i></div><span id="s-progtxt"></span></div>
+    <div id="s-out" hidden>
+      <h3>选型表 <span class="tag" id="s-meta"></span></h3>
+      <table id="s-table"></table>
+      <p class="note" id="s-rec"></p>
+      <p class="note"><button id="s-apply" class="small" hidden>把建议线程数填进第 1 节</button></p>
+    </div>
+  </section>
+
+  <section class="card" id="card-result" hidden>
+    <h2>5 · 评测结果 <button id="export" class="small">导出 JSON 报告</button></h2>
+    <div class="kpis" id="kpis"></div>
+    <!-- 真值本身有毛病时（合影的图级真值和主体脸级真值打架），上面那排数字不算错，
+         但那批指标不能直接当结论用，得单独有一行话把话说在前面。 -->
+    <p class="note" id="truth-note" hidden></p>
+    <!-- 探针复核图被手工清掉，或者这批本来就不存图（并发扫描跑出来的批次），
+         指标照样能看能改标，但双图对照卡会碎成一片裂图图标。
+         得有一行话说明白：图是我们主动不要的，不是这批评测坏了。 -->
+    <p class="note" id="gone-note" hidden></p>
+    <div class="grid2">
+      <div>
+        <h3>分阶段耗时（ms）</h3>
+        <table id="lat"></table>
+        <h3>阈值滑杆实时重判</h3>
+        <div class="row">
+          <!-- 滑杆和上面的判定阈值数字框都到 1，两边报的是同一个数。
+               step 必须和上面的数字框一样细（0.0001）：建议阈值本来就是 0.4078 这种
+               四位小数，迈 0.001 的步子时浏览器会把它吸到 0.408，于是结果卡上写着
+               0.408、数字框里写着 0.4078，同一件事两个数；拖一下滑杆判定线就永久
+               偏了 0.0002，还说不清是自己改的还是页面改的。
+               aria-label 是给读屏用的：这个滑杆上面只有一行 <h3>，没有 <label for>，
+               键盘用户聚焦上去时只能念出「滑块」。 -->
+          <input type="range" id="thr-slider" min="0" max="1" step="0.0001" value="0.4078"
+                 aria-label="判定阈值">
+          <b id="thr-val">0.4078</b>
+        </div>
+        <p class="note" id="thr-advice"></p>
+      </div>
+      <div>
+        <h3>阈值 → 通过率 / 误识率</h3>
+        <canvas id="chart-thr" height="200"></canvas>
+        <h3>底库规模 → 检索耗时</h3>
+        <canvas id="chart-scale" height="160"></canvas>
+      </div>
+    </div>
+    <h3>比对结果（成功的出对照图，没成功的只列清单） <span class="tag" id="p-tag"></span></h3>
+    <div class="row center" id="p-pager">
+      <label>只看
+        <select id="p-filter"><option value="all">全部</option></select>
+      </label>
+      <button id="p-prev" class="small">← 上一页</button>
+      <button id="p-next" class="small">下一页 →</button>
+      <span class="tag" id="p-showing"></span>
+    </div>
+    <div id="records" class="records"></div>
+    <h3>易混淆对</h3>
+    <div id="conf" class="conf"></div>
+  </section>
+</main>
+
+<datalist id="person-list"></datalist>
+<input type="file" id="file-g-dir" webkitdirectory multiple hidden>
+<input type="file" id="file-g-files" multiple hidden accept="image/*">
+<input type="file" id="file-p-dir" webkitdirectory multiple hidden>
+<input type="file" id="file-p-files" multiple hidden accept="image/*">
+<div id="toast"></div>
+<script src="/static/app.js?v=__BUILD__"></script>
+</body>
+</html>

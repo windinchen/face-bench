@@ -1,0 +1,127 @@
+:root{
+  --bg:#0e1116;--panel:#161b22;--line:#232b36;--ink:#e6edf3;--dim:#8b98a5;
+  --ok:#2ea043;--bad:#f85149;--warn:#d29922;--acc:#388bfd;
+}
+*{box-sizing:border-box}
+/* 下面很多条都自带 display，会把 hidden 属性顶掉，这里统一兜底 */
+[hidden]{display:none!important}
+body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.6 -apple-system,"PingFang SC","Microsoft YaHei",system-ui,sans-serif}
+header{display:flex;justify-content:space-between;align-items:flex-end;gap:16px;flex-wrap:wrap;
+  padding:18px 22px;border-bottom:1px solid var(--line);background:linear-gradient(180deg,#141a22,#0e1116)}
+h1{margin:0;font-size:19px;letter-spacing:.5px}
+.sub{color:var(--dim);font-size:12px}
+.env{display:flex;gap:8px;flex-wrap:wrap}
+.pill{background:#1c232d;border:1px solid var(--line);border-radius:999px;padding:3px 11px;font-size:12px;color:var(--dim)}
+.pill b{color:var(--ink);font-weight:600}
+.pill.ok b{color:var(--ok)} .pill.bad b{color:var(--bad)}
+main{padding:18px 22px 60px;max-width:1320px;margin:0 auto}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px 18px;margin-bottom:16px}
+h2{margin:0 0 12px;font-size:15px} h3{margin:18px 0 8px;font-size:13px;color:var(--dim);font-weight:600}
+.row{display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap;margin-bottom:10px}
+.row.center{justify-content:center;margin-top:10px}
+label{display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--dim)}
+label.grow{flex:1;min-width:220px}
+select,input{background:#0d1117;border:1px solid var(--line);color:var(--ink);border-radius:7px;padding:7px 9px;font-size:13px;font-family:inherit}
+input[type=range]{padding:0;width:260px}
+button{background:#21262d;border:1px solid var(--line);color:var(--ink);border-radius:7px;padding:8px 14px;
+  font-size:13px;cursor:pointer;font-family:inherit;transition:.15s}
+button:hover{border-color:#3d444d;background:#2c333b}
+button.primary{background:var(--acc);border-color:#1f6feb;color:#fff}
+button.primary:hover{background:#4a8f9f;background:#4c8dfd}
+button.danger{color:var(--bad)} button.small{padding:3px 9px;font-size:12px}
+button:disabled{opacity:.45;cursor:not-allowed}
+.note{color:var(--dim);font-size:12px;margin:6px 0 0}
+.tag{font-size:11px;background:#1f2937;border-radius:999px;padding:2px 9px;color:var(--dim);margin-left:8px;font-weight:400}
+.drop{border:1.5px dashed #2f3742;border-radius:10px;padding:18px;text-align:center;transition:.2s;background:#12171e}
+.drop.hot{border-color:var(--acc);background:#131c29}
+.drop-inner strong{display:block;font-size:14px;margin-bottom:3px}
+.drop-inner span{color:var(--dim);font-size:12px}
+code{background:#0d1117;padding:1px 5px;border-radius:4px;font-size:12px}
+.pend{margin-top:9px;font-size:12px;color:var(--warn);min-height:16px}
+.prog{margin-top:12px;display:flex;align-items:center;gap:10px;font-size:12px;color:var(--dim)}
+.bar{flex:1;height:7px;background:#0d1117;border-radius:99px;overflow:hidden;border:1px solid var(--line)}
+.bar i{display:block;height:100%;width:0;background:linear-gradient(90deg,#238636,#3fb950);transition:.2s}
+.persons{margin-top:12px;display:flex;gap:8px;flex-wrap:wrap;max-height:240px;overflow:auto}
+.pager{margin-top:14px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12px;color:var(--dim)}
+.pager input[type=search]{background:#0d1117;border:1px solid var(--line);border-radius:7px;color:var(--ink);padding:4px 8px;font-size:12px}
+.pager .psize{display:flex;align-items:center;gap:5px}
+.pager .psize select{background:#0d1117;border:1px solid var(--line);border-radius:7px;color:var(--ink);padding:3px 5px;font-size:12px}
+.pageinfo{min-width:74px;text-align:center;font-variant-numeric:tabular-nums}
+.pager button:disabled{opacity:.4;cursor:not-allowed}
+.tsel{background:#0d1117;border:1px solid var(--line);border-radius:7px;color:var(--ink);padding:4px 7px;font-size:12px;min-width:150px}
+.tsel::placeholder{color:#6e7681}
+/* position:relative 是给格子里那颗「只删这个人」的 ✕ 定位用的，
+   绝对定位才不会把人名和张数挤得忽上忽下（每个人名长度不一样）。 */
+.pcell{position:relative;background:#0d1117;border:1px solid var(--line);border-radius:8px;padding:5px 26px 5px 9px;font-size:12px}
+.pcell b{color:var(--ink)} .pcell.warn{border-color:#5a4510}
+.pcell img{width:26px;height:26px;border-radius:5px;object-fit:cover;vertical-align:-7px;margin-right:6px;background:#222}
+/* 常驻收起的删除钮：平时只留一点存在感，鼠标进格子才亮起来，
+   否则几千人的底库满屏都是红叉，看着像整库都要没了。 */
+.pdel{position:absolute;top:4px;right:4px;padding:0 6px;font-size:11px;opacity:.4}
+.pcell:hover .pdel{opacity:1}
+.pdel:hover{color:var(--bad);border-color:#5a3a3a}
+/* min-width:0 是被 12 张卡撑出来的问题：网格项默认 min-width:auto，
+   「吞吐 图 / 脸 每秒 · 整批墙钟 · 4 路并发」这类长标签会把列顶得比 148px 宽，
+   最后一张卡被挤到下一行孤零零占满一整行。长标签改成就地折行才对。 */
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(148px,1fr));gap:10px}
+.kpi{min-width:0;background:#0d1117;border:1px solid var(--line);border-radius:10px;padding:12px 14px}
+.kpi .v{font-size:26px;font-weight:700;letter-spacing:.5px}
+.kpi .l{font-size:12px;color:var(--dim);overflow-wrap:anywhere}
+.kpi.hi .v{color:var(--ok)} .kpi.lo .v{color:var(--warn)} .kpi.bad .v{color:var(--bad)}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:22px}
+@media(max-width:900px){.grid2{grid-template-columns:1fr}}
+table{border-collapse:collapse;width:100%;font-size:12.5px}
+th,td{border-bottom:1px solid var(--line);padding:6px 8px;text-align:right}
+th:first-child,td:first-child{text-align:left;color:var(--dim)}
+th{font-weight:600;color:var(--dim)}
+canvas{width:100%;background:#0d1117;border:1px solid var(--line);border-radius:8px}
+.records{display:flex;flex-direction:column;gap:10px}
+.badge{font-size:11px;padding:1px 7px;border-radius:999px;font-weight:600}
+.badge.ok{background:rgba(46,160,67,.18);color:#3fb950}
+.badge.bad{background:rgba(248,81,73,.16);color:#f85149}
+.badge.warn{background:rgba(210,153,34,.16);color:#d29922}
+.badge.info{background:#1f2937;color:var(--dim)}
+/* .rec / .face / .fq 那一整套逐脸表格样式早就随渲染换成 .pair/.pmid/.mrow 了，
+   留着不只是体积问题：.rec .sc 看着像在管相似度分数，其实选不到任何元素，
+   分数实际落在 .pmid .sc 上 —— 于是等宽这条一直没生效，多位数上下不对齐。 */
+.pmid .sc{font-family:ui-monospace,monospace;color:var(--ink)}
+.fquick{display:flex;gap:4px}
+.qbtn{flex:1;padding:4px 3px;font-size:11px;border-radius:6px;white-space:nowrap}
+.qbtn.ok{color:#3fb950} .qbtn.no{color:var(--warn)}
+.dim{color:var(--dim);font-size:11px}
+.qwarn{color:var(--warn);font-size:10.5px}
+.conf{font-size:12.5px;color:var(--dim)}
+.conf span{display:inline-block;background:#0d1117;border:1px solid var(--line);border-radius:6px;padding:3px 9px;margin:0 6px 6px 0}
+#toast{position:fixed;left:50%;bottom:34px;transform:translateX(-50%) translateY(20px);background:#1f2937;
+  border:1px solid var(--line);border-radius:9px;padding:10px 18px;font-size:13px;opacity:0;pointer-events:none;transition:.25s;z-index:9}
+#toast.on{opacity:1;transform:translateX(-50%) translateY(0)}
+
+/* 比对结果：成功出双图对照，失败只出清单 */
+.g-h{font-size:12px;font-weight:600;color:var(--dim);letter-spacing:.3px;margin:16px 0 8px}
+.g-h.ok{color:#3fb950} .g-h.no{color:var(--warn)}
+.pad{padding:14px}
+.pairs{display:grid;grid-template-columns:repeat(auto-fill,minmax(392px,1fr));gap:10px}
+@media(max-width:860px){.pairs{grid-template-columns:1fr}}
+.pair{background:#0d1117;border:1px solid var(--line);border-radius:9px;padding:9px;font-size:12px}
+.pair.la{border-color:rgba(46,160,67,.45)}
+.prow{display:flex;gap:9px;align-items:flex-start}
+.pp{flex:1;min-width:0;display:flex;flex-direction:column;gap:3px}
+.pl{font-size:10px;color:var(--dim);letter-spacing:.3px}
+.pimg{width:100%;height:126px;object-fit:cover;border-radius:7px;background:#1c2128;border:1px solid var(--line)}
+.pimg.ref{border-color:#2f4a6d}
+.pf{color:var(--dim);font-size:10.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pmid{flex:0 0 60px;display:flex;flex-direction:column;align-items:center;gap:4px;padding-top:22px}
+.pmid .tag{margin-left:0;font-size:10px;padding:1px 6px}
+.arrow{color:#3fb950;font-size:16px;line-height:1}
+.pmeta{display:flex;flex-direction:column;gap:5px;margin-top:8px;padding-top:8px;border-top:1px dashed var(--line)}
+.pmeta .fquick{display:flex;gap:5px}
+.pmeta .tsel{width:100%;box-sizing:border-box;min-width:0}
+.mlist{display:flex;flex-direction:column;gap:4px}
+.mrow{display:flex;gap:10px;align-items:center;background:#0d1117;border:1px solid var(--line);
+  border-radius:7px;padding:6px 10px;font-size:12px}
+.mrow.la{border-color:rgba(46,160,67,.42)}
+.mrow .mn{flex:1 1 auto;min-width:110px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mrow .dim{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mrow .tag{margin-left:0;flex:0 0 auto}
+.mrow .qbtn{flex:0 0 auto;padding:3px 9px;font-size:11px}
+.mrow .qwarn{flex:0 0 auto}
